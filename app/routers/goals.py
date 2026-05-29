@@ -1,65 +1,98 @@
-import os
 import uuid
-from typing import Annotated, List
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from typing import Annotated, List, Optional
+from uuid import UUID
+from datetime import datetime, date
+from decimal import Decimal
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, and_
 from sqlalchemy.orm import selectinload
 from app.core.database import get_db
 from app.core.deps import get_current_user
-from app.core.config import settings
 from app.models.user import User
 from app.models.goal import Goal, GoalMember, GoalDeposit
 from app.schemas.goal import (
     GoalCreate,
     GoalUpdate,
     GoalResponse,
+    GoalSummaryResponse,
     GoalMemberResponse,
-    GoalDepositCreate,
     GoalDepositResponse,
+    GoalDepositCreate,
+    GoalDepositConfirmRequest,
+    GoalInviteRequest,
 )
-from datetime import datetime
-from decimal import Decimal
+from app.services import cloudinary_service
 
 router = APIRouter()
 
 
-async def _get_goal_with_relations(goal_id: int, db: AsyncSession) -> Goal:
+async def _load_goal_with_relations(goal_id: UUID, db: AsyncSession) -> Optional[Goal]:
+    """Load goal with all relations"""
     result = await db.execute(
         select(Goal)
+        .where(Goal.id == goal_id)
         .options(
             selectinload(Goal.members).selectinload(GoalMember.user),
-            selectinload(Goal.deposits).selectinload(GoalDeposit.depositor),
+            selectinload(Goal.deposits),
         )
-        .where(Goal.id == goal_id)
     )
     return result.scalar_one_or_none()
 
 
-@router.get("/", response_model=List[GoalResponse])
-async def list_goals(
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-):
-    member_goal_ids_result = await db.execute(
-        select(GoalMember.goal_id).where(GoalMember.user_id == current_user.id)
-    )
-    member_goal_ids = [row[0] for row in member_goal_ids_result.fetchall()]
+async def _build_goal_response(goal_obj: Goal) -> GoalResponse:
+    """Convert goal to response model"""
+    members_resp = [
+        GoalMemberResponse(
+            id=m.id,
+            goal_id=m.goal_id,
+            user_id=m.user_id,
+            split_percent=m.split_percent,
+            target_amount=m.target_amount,
+            contributed=m.contributed,
+            invite_status=m.invite_status,
+            joined_at=m.joined_at,
+        )
+        for m in goal_obj.members
+    ]
 
-    result = await db.execute(
-        select(Goal)
-        .options(
-            selectinload(Goal.members).selectinload(GoalMember.user),
-            selectinload(Goal.deposits).selectinload(GoalDeposit.depositor),
+    deposits_resp = [
+        GoalDepositResponse(
+            id=d.id,
+            goal_id=d.goal_id,
+            user_id=d.user_id,
+            amount=d.amount,
+            proof_url=d.proof_url,
+            proof_type=d.proof_type,
+            note=d.note,
+            deposited_at=d.deposited_at,
+            status=d.status,
+            confirmed_at=d.confirmed_at,
+            confirmed_by=d.confirmed_by,
+            rejection_note=d.rejection_note,
+            created_at=d.created_at,
         )
-        .where(
-            or_(
-                Goal.creator_id == current_user.id,
-                Goal.id.in_(member_goal_ids),
-            )
-        )
+        for d in goal_obj.deposits
+    ]
+
+    return GoalResponse(
+        id=goal_obj.id,
+        name=goal_obj.name,
+        created_by=goal_obj.created_by,
+        target_amount=goal_obj.target_amount,
+        currency=goal_obj.currency,
+        target_date=goal_obj.target_date,
+        goal_type=goal_obj.goal_type,
+        suggested_frequency=goal_obj.suggested_frequency,
+        suggested_amount=goal_obj.suggested_amount,
+        current_total=goal_obj.current_total,
+        target_account_id=goal_obj.target_account_id,
+        status=goal_obj.status,
+        created_at=goal_obj.created_at,
+        updated_at=goal_obj.updated_at,
+        members=members_resp,
+        deposits=deposits_resp,
     )
-    return result.scalars().all()
 
 
 @router.post("/", response_model=GoalResponse, status_code=status.HTTP_201_CREATED)
@@ -68,295 +101,464 @@ async def create_goal(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
+    """Create a new goal"""
     goal = Goal(
-        creator_id=current_user.id,
         name=data.name,
-        goal_type=data.goal_type,
+        created_by=current_user.id,
         target_amount=data.target_amount,
         currency=data.currency,
         target_date=data.target_date,
-        frequency=data.frequency,
-        deposit_amount=data.deposit_amount,
-        account_name=data.account_name,
-        bank_name=data.bank_name,
-        account_number_masked=data.account_number_masked,
-        emoji=data.emoji,
+        goal_type=data.goal_type,
+        suggested_frequency=data.suggested_frequency,
+        suggested_amount=data.suggested_amount,
+        target_account_id=data.target_account_id,
         status="active",
-        current_amount=Decimal("0"),
     )
     db.add(goal)
     await db.flush()
 
-    # Add creator as member
-    member = GoalMember(
+    # Add creator as a member
+    creator_member = GoalMember(
         goal_id=goal.id,
         user_id=current_user.id,
-        split_percent=Decimal("100") if data.goal_type == "solo" else None,
-        target_amount=data.target_amount if data.goal_type == "solo" else None,
+        invite_status="accepted",
     )
-    db.add(member)
-    await db.commit()
+    db.add(creator_member)
+    await db.flush()
 
-    return await _get_goal_with_relations(goal.id, db)
+    # Load full goal
+    full_goal = await _load_goal_with_relations(goal.id, db)
+    return await _build_goal_response(full_goal)
+
+
+@router.get("/", response_model=List[GoalSummaryResponse])
+async def list_goals(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """List goals where user is creator or member"""
+    member_goal_ids_result = await db.execute(
+        select(GoalMember.goal_id).where(GoalMember.user_id == current_user.id)
+    )
+    member_goal_ids = [row[0] for row in member_goal_ids_result.fetchall()]
+
+    result = await db.execute(
+        select(Goal)
+        .where(
+            or_(
+                Goal.created_by == current_user.id,
+                Goal.id.in_(member_goal_ids) if member_goal_ids else False,
+            )
+        )
+        .options(selectinload(Goal.members))
+    )
+    goals = result.scalars().all()
+
+    return [
+        GoalSummaryResponse(
+            id=g.id,
+            name=g.name,
+            created_by=g.created_by,
+            target_amount=g.target_amount,
+            currency=g.currency,
+            target_date=g.target_date,
+            current_total=g.current_total,
+            status=g.status,
+            members_count=len(g.members),
+            created_at=g.created_at,
+        )
+        for g in goals
+    ]
 
 
 @router.get("/{goal_id}", response_model=GoalResponse)
 async def get_goal(
-    goal_id: int,
+    goal_id: UUID,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    goal = await _get_goal_with_relations(goal_id, db)
+    """Get goal detail"""
+    goal = await _load_goal_with_relations(goal_id, db)
+
     if not goal:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Goal not found",
         )
 
+    # Check access
+    is_creator = goal.created_by == current_user.id
     is_member = any(m.user_id == current_user.id for m in goal.members)
-    if goal.creator_id != current_user.id and not is_member:
+
+    if not is_creator and not is_member:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Access denied"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
         )
 
-    return goal
+    return await _build_goal_response(goal)
 
 
 @router.put("/{goal_id}", response_model=GoalResponse)
 async def update_goal(
-    goal_id: int,
+    goal_id: UUID,
     data: GoalUpdate,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    result = await db.execute(select(Goal).where(Goal.id == goal_id))
-    goal = result.scalar_one_or_none()
+    """Update goal (creator only)"""
+    goal = await _load_goal_with_relations(goal_id, db)
+
     if not goal:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found"
-        )
-    if goal.creator_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Only creator can update goal"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Goal not found",
         )
 
-    update_data = data.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(goal, field, value)
+    if goal.created_by != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only creator can update goal",
+        )
+
+    if data.name:
+        goal.name = data.name
+    if data.target_amount:
+        goal.target_amount = data.target_amount
+    if data.target_date:
+        goal.target_date = data.target_date
+
     goal.updated_at = datetime.utcnow()
+    db.add(goal)
+    await db.flush()
 
-    await db.commit()
-    return await _get_goal_with_relations(goal_id, db)
-
-
-@router.delete("/{goal_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_goal(
-    goal_id: int,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-):
-    result = await db.execute(select(Goal).where(Goal.id == goal_id))
-    goal = result.scalar_one_or_none()
-    if not goal:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found"
-        )
-    if goal.creator_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Only creator can delete goal"
-        )
-
-    await db.delete(goal)
-    await db.commit()
+    # Reload
+    full_goal = await _load_goal_with_relations(goal_id, db)
+    return await _build_goal_response(full_goal)
 
 
-@router.post(
-    "/{goal_id}/invite",
-    response_model=GoalMemberResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-async def invite_member(
-    goal_id: int,
-    user_id: int,
-    split_percent: float = None,
+@router.post("/{goal_id}/deposits", response_model=GoalDepositResponse, status_code=status.HTTP_201_CREATED)
+async def record_deposit(
+    goal_id: UUID,
+    amount: Decimal,
+    proof_type: Optional[str] = None,
+    note: Optional[str] = None,
+    file: Optional[UploadFile] = File(None),
     current_user: Annotated[User, Depends(get_current_user)] = None,
     db: Annotated[AsyncSession, Depends(get_db)] = None,
 ):
-    result = await db.execute(select(Goal).where(Goal.id == goal_id))
-    goal = result.scalar_one_or_none()
+    """Record deposit for goal"""
+    goal = await _load_goal_with_relations(goal_id, db)
+
     if not goal:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Goal not found",
         )
-    if goal.creator_id != current_user.id:
+
+    # Check if member
+    is_creator = goal.created_by == current_user.id
+    is_member = any(m.user_id == current_user.id for m in goal.members)
+
+    if not is_creator and not is_member:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only creator can invite members",
-        )
-    if goal.goal_type != "group":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Can only invite to group goals",
+            detail="Not a member of this goal",
         )
 
-    result = await db.execute(select(User).where(User.id == user_id))
-    invited_user = result.scalar_one_or_none()
-    if not invited_user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+    # Upload proof if provided
+    proof_url = None
+    if file:
+        file_bytes = await file.read()
+        public_id = await cloudinary_service.upload_goal_proof(
+            goal_id, current_user.id, file_bytes, proof_type or "receipt"
         )
+        proof_url = cloudinary_service.get_signed_url(public_id)
 
-    existing = await db.execute(
-        select(GoalMember).where(
-            GoalMember.goal_id == goal_id, GoalMember.user_id == user_id
-        )
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="User already a member"
-        )
-
-    member = GoalMember(
+    # Create deposit
+    deposit = GoalDeposit(
         goal_id=goal_id,
-        user_id=user_id,
-        split_percent=Decimal(str(split_percent)) if split_percent else None,
-        target_amount=(
-            (goal.target_amount * Decimal(str(split_percent)) / 100)
-            if split_percent
-            else None
-        ),
+        user_id=current_user.id,
+        amount=amount,
+        proof_url=proof_url,
+        proof_type=proof_type,
+        note=note,
+        deposited_at=datetime.utcnow(),
+        status="pending",
     )
-    db.add(member)
-    await db.commit()
-    await db.refresh(member)
+    db.add(deposit)
+    await db.flush()
 
-    result = await db.execute(
-        select(GoalMember)
-        .options(selectinload(GoalMember.user))
-        .where(GoalMember.id == member.id)
+    return GoalDepositResponse(
+        id=deposit.id,
+        goal_id=deposit.goal_id,
+        user_id=deposit.user_id,
+        amount=deposit.amount,
+        proof_url=deposit.proof_url,
+        proof_type=deposit.proof_type,
+        note=deposit.note,
+        deposited_at=deposit.deposited_at,
+        status=deposit.status,
+        confirmed_at=deposit.confirmed_at,
+        confirmed_by=deposit.confirmed_by,
+        rejection_note=deposit.rejection_note,
+        created_at=deposit.created_at,
     )
-    return result.scalar_one()
-
-
-@router.get("/{goal_id}/members", response_model=List[GoalMemberResponse])
-async def list_members(
-    goal_id: int,
-    current_user: Annotated[User, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-):
-    result = await db.execute(
-        select(GoalMember)
-        .options(selectinload(GoalMember.user))
-        .where(GoalMember.goal_id == goal_id)
-    )
-    return result.scalars().all()
 
 
 @router.get("/{goal_id}/deposits", response_model=List[GoalDepositResponse])
 async def list_deposits(
-    goal_id: int,
+    goal_id: UUID,
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    result = await db.execute(
-        select(GoalDeposit)
-        .options(selectinload(GoalDeposit.depositor))
-        .where(GoalDeposit.goal_id == goal_id)
-        .order_by(GoalDeposit.created_at.desc())
-    )
-    return result.scalars().all()
+    """Get deposit history for goal"""
+    goal = await _load_goal_with_relations(goal_id, db)
 
-
-@router.post(
-    "/{goal_id}/deposits",
-    response_model=GoalDepositResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_deposit(
-    goal_id: int,
-    amount: Annotated[str, Form()],
-    proof_type: Annotated[str | None, Form()] = None,
-    note: Annotated[str | None, Form()] = None,
-    deposited_at: Annotated[str | None, Form()] = None,
-    proof_file: Annotated[UploadFile | None, File()] = None,
-    current_user: Annotated[User, Depends(get_current_user)] = None,
-    db: Annotated[AsyncSession, Depends(get_db)] = None,
-):
-    result = await db.execute(select(Goal).where(Goal.id == goal_id))
-    goal = result.scalar_one_or_none()
     if not goal:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Goal not found"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Goal not found",
         )
 
-    # Check membership
-    member_check = await db.execute(
-        select(GoalMember).where(
-            GoalMember.goal_id == goal_id, GoalMember.user_id == current_user.id
-        )
-    )
-    if not member_check.scalar_one_or_none():
+    # Check access
+    is_creator = goal.created_by == current_user.id
+    is_member = any(m.user_id == current_user.id for m in goal.members)
+
+    if not is_creator and not is_member:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Not a member of this goal"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
         )
 
-    deposit_amount = Decimal(amount)
-    proof_file_path = None
-
-    if proof_file:
-        ext = (
-            os.path.splitext(proof_file.filename)[1] if proof_file.filename else ".jpg"
+    return [
+        GoalDepositResponse(
+            id=d.id,
+            goal_id=d.goal_id,
+            user_id=d.user_id,
+            amount=d.amount,
+            proof_url=d.proof_url,
+            proof_type=d.proof_type,
+            note=d.note,
+            deposited_at=d.deposited_at,
+            status=d.status,
+            confirmed_at=d.confirmed_at,
+            confirmed_by=d.confirmed_by,
+            rejection_note=d.rejection_note,
+            created_at=d.created_at,
         )
-        filename = f"{uuid.uuid4()}{ext}"
-        proof_dir = os.path.join(settings.UPLOAD_DIR, "goal_proofs")
-        os.makedirs(proof_dir, exist_ok=True)
-        file_path = os.path.join(proof_dir, filename)
-        content = await proof_file.read()
-        with open(file_path, "wb") as f:
-            f.write(content)
-        proof_file_path = f"/uploads/goal_proofs/{filename}"
+        for d in goal.deposits
+    ]
 
-    parsed_deposited_at = None
-    if deposited_at:
-        try:
-            parsed_deposited_at = datetime.fromisoformat(deposited_at)
-        except ValueError:
-            parsed_deposited_at = datetime.utcnow()
 
-    deposit = GoalDeposit(
-        goal_id=goal_id,
-        depositor_id=current_user.id,
-        amount=deposit_amount,
-        proof_type=proof_type,
-        proof_file_path=proof_file_path,
-        note=note,
-        deposited_at=parsed_deposited_at or datetime.utcnow(),
+@router.post("/{goal_id}/invite", status_code=status.HTTP_201_CREATED)
+async def invite_member(
+    goal_id: UUID,
+    invite_data: GoalInviteRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Invite member to goal (creator only)"""
+    goal = await _load_goal_with_relations(goal_id, db)
+
+    if not goal:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Goal not found",
+        )
+
+    if goal.created_by != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only creator can invite members",
+        )
+
+    # Find user by email or phone
+    user_result = None
+    if invite_data.email:
+        user_result = await db.execute(
+            select(User).where(User.email == invite_data.email)
+        )
+    elif invite_data.phone:
+        user_result = await db.execute(
+            select(User).where(User.phone == invite_data.phone)
+        )
+
+    user = user_result.scalar_one_or_none() if user_result else None
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    # Check if already member
+    existing_result = await db.execute(
+        select(GoalMember).where(
+            and_(
+                GoalMember.goal_id == goal_id,
+                GoalMember.user_id == user.id,
+            )
+        )
     )
-    db.add(deposit)
+    if existing_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User is already a member",
+        )
 
-    # Update goal current_amount
-    goal.current_amount = (goal.current_amount or Decimal("0")) + deposit_amount
-    if goal.current_amount >= goal.target_amount:
-        goal.status = "completed"
-    goal.updated_at = datetime.utcnow()
+    # Add member
+    member = GoalMember(
+        goal_id=goal_id,
+        user_id=user.id,
+        split_percent=invite_data.split_percent,
+        target_amount=invite_data.target_amount,
+        invite_status="pending",
+    )
+    db.add(member)
+    await db.flush()
 
-    # Update member contributed_amount
+    return {"message": "Member invited"}
+
+
+@router.put("/{goal_id}/deposits/{deposit_id}/confirm", response_model=GoalDepositResponse)
+async def confirm_deposit(
+    goal_id: UUID,
+    deposit_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Confirm deposit (goal creator only)"""
+    goal = await _load_goal_with_relations(goal_id, db)
+
+    if not goal:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Goal not found",
+        )
+
+    if goal.created_by != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only creator can confirm deposits",
+        )
+
+    deposit_result = await db.execute(
+        select(GoalDeposit).where(
+            and_(
+                GoalDeposit.id == deposit_id,
+                GoalDeposit.goal_id == goal_id,
+            )
+        )
+    )
+    deposit = deposit_result.scalar_one_or_none()
+
+    if not deposit:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Deposit not found",
+        )
+
+    # Confirm deposit
+    deposit.status = "confirmed"
+    deposit.confirmed_at = datetime.utcnow()
+    deposit.confirmed_by = current_user.id
+
+    # Update goal current_total and member contributed
+    goal.current_total += deposit.amount
+
     member_result = await db.execute(
         select(GoalMember).where(
-            GoalMember.goal_id == goal_id, GoalMember.user_id == current_user.id
+            and_(
+                GoalMember.goal_id == goal_id,
+                GoalMember.user_id == deposit.user_id,
+            )
         )
     )
     member = member_result.scalar_one_or_none()
     if member:
-        member.contributed_amount = (
-            member.contributed_amount or Decimal("0")
-        ) + deposit_amount
+        member.contributed += deposit.amount
+        db.add(member)
 
-    await db.commit()
-    await db.refresh(deposit)
+    goal.updated_at = datetime.utcnow()
+    db.add(goal)
+    db.add(deposit)
+    await db.flush()
 
-    result = await db.execute(
-        select(GoalDeposit)
-        .options(selectinload(GoalDeposit.depositor))
-        .where(GoalDeposit.id == deposit.id)
+    return GoalDepositResponse(
+        id=deposit.id,
+        goal_id=deposit.goal_id,
+        user_id=deposit.user_id,
+        amount=deposit.amount,
+        proof_url=deposit.proof_url,
+        proof_type=deposit.proof_type,
+        note=deposit.note,
+        deposited_at=deposit.deposited_at,
+        status=deposit.status,
+        confirmed_at=deposit.confirmed_at,
+        confirmed_by=deposit.confirmed_by,
+        rejection_note=deposit.rejection_note,
+        created_at=deposit.created_at,
     )
-    return result.scalar_one()
+
+
+@router.put("/{goal_id}/deposits/{deposit_id}/reject", response_model=GoalDepositResponse)
+async def reject_deposit(
+    goal_id: UUID,
+    deposit_id: UUID,
+    rejection_note: Optional[str] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None,
+    db: Annotated[AsyncSession, Depends(get_db)] = None,
+):
+    """Reject deposit (goal creator only)"""
+    goal = await _load_goal_with_relations(goal_id, db)
+
+    if not goal:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Goal not found",
+        )
+
+    if goal.created_by != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only creator can reject deposits",
+        )
+
+    deposit_result = await db.execute(
+        select(GoalDeposit).where(
+            and_(
+                GoalDeposit.id == deposit_id,
+                GoalDeposit.goal_id == goal_id,
+            )
+        )
+    )
+    deposit = deposit_result.scalar_one_or_none()
+
+    if not deposit:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Deposit not found",
+        )
+
+    # Reject deposit
+    deposit.status = "rejected"
+    deposit.rejection_note = rejection_note
+    db.add(deposit)
+    await db.flush()
+
+    return GoalDepositResponse(
+        id=deposit.id,
+        goal_id=deposit.goal_id,
+        user_id=deposit.user_id,
+        amount=deposit.amount,
+        proof_url=deposit.proof_url,
+        proof_type=deposit.proof_type,
+        note=deposit.note,
+        deposited_at=deposit.deposited_at,
+        status=deposit.status,
+        confirmed_at=deposit.confirmed_at,
+        confirmed_by=deposit.confirmed_by,
+        rejection_note=deposit.rejection_note,
+        created_at=deposit.created_at,
+    )

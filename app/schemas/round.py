@@ -1,98 +1,170 @@
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal
-from app.schemas.user import UserResponse
+from uuid import UUID
+
+
+class RoundMemberResponse(BaseModel):
+    id: UUID
+    user_id: UUID
+    round_id: UUID
+    payout_position: Optional[int] = None
+    contract_signed_at: Optional[datetime] = None
+    invite_status: str
+    is_active: bool
+    joined_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class RoundMemberDetailResponse(RoundMemberResponse):
+    trust_score: Optional[Decimal] = None
 
 
 class RoundCreate(BaseModel):
     name: str
     contribution_amount: Decimal
-    currency: str = "USD"
-    frequency: str  # weekly/biweekly/monthly
+    currency: Optional[str] = "USD"
+    cycle_frequency: str  # weekly/biweekly/monthly
     total_cycles: int
+    start_date: date
+    payout_order_method: str  # random/custom
     grace_period_days: Optional[int] = 3
-    start_date: Optional[datetime] = None
+    late_penalty_amount: Optional[Decimal] = 0
+    default_penalty: Optional[str] = None
+    collateral_required: Optional[bool] = False
+    contract_mode: Optional[str] = "simple"
 
 
 class RoundUpdate(BaseModel):
     name: Optional[str] = None
     contribution_amount: Optional[Decimal] = None
     currency: Optional[str] = None
-    frequency: Optional[str] = None
-    total_cycles: Optional[int] = None
     grace_period_days: Optional[int] = None
-    start_date: Optional[datetime] = None
 
 
-class RoundMemberResponse(BaseModel):
-    id: int
-    user_id: int
-    round_id: int
-    payout_position: Optional[int] = None
-    signed_at: Optional[datetime] = None
-    joined_at: datetime
-    user: Optional[UserResponse] = None
+class CyclePaymentResponse(BaseModel):
+    id: UUID
+    cycle_id: UUID
+    payer_id: UUID
+    amount: Decimal
+    due_date: date
+    paid_at: Optional[datetime] = None
+    proof_url: Optional[str] = None
+    proof_type: Optional[str] = None
+    note: Optional[str] = None
+    status: str
+    confirmed_at: Optional[datetime] = None
+    auto_confirmed: bool
+    created_at: datetime
 
     model_config = {"from_attributes": True}
-
-
-class PaymentCreate(BaseModel):
-    amount: Decimal
-    proof_type: Optional[str] = None
 
 
 class SubmitProofRequest(BaseModel):
     proof_type: str
-    note: str = ""
+    note: Optional[str] = None
 
 
-class PaymentResponse(BaseModel):
-    id: int
-    cycle_id: int
-    payer_id: int
+class PaymentConfirmRequest(BaseModel):
+    confirmed: bool
+
+
+class PaymentDisputeRequest(BaseModel):
+    reason: str
+
+
+class RoundCycleResponse(BaseModel):
+    id: UUID
+    round_id: UUID
+    cycle_number: int
+    recipient_id: Optional[UUID] = None
+    due_date: date
+    payout_date: Optional[date] = None
+    total_expected: Decimal
+    total_received: Decimal
+    status: str
+    payments: List[CyclePaymentResponse] = []
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class RoundLedgerEntry(BaseModel):
+    payment_id: UUID
+    cycle_number: int
+    payer_id: UUID
     amount: Decimal
     status: str
-    proof_type: Optional[str] = None
-    proof_file_path: Optional[str] = None
-    note: Optional[str] = None
-    submitted_at: Optional[datetime] = None
+    paid_at: Optional[datetime] = None
     confirmed_at: Optional[datetime] = None
-    confirmed_by_id: Optional[int] = None
-    created_at: datetime
-    updated_at: datetime
-    payer: Optional[UserResponse] = None
-
-    model_config = {"from_attributes": True}
-
-
-class CycleResponse(BaseModel):
-    id: int
-    round_id: int
-    cycle_number: int
-    recipient_id: Optional[int] = None
-    due_date: Optional[datetime] = None
-    is_complete: bool
-    completed_at: Optional[datetime] = None
-    payments: List[PaymentResponse] = []
-    recipient: Optional[UserResponse] = None
-
-    model_config = {"from_attributes": True}
+    proof_type: Optional[str] = None
 
 
 class RoundResponse(BaseModel):
-    id: int
+    id: UUID
     name: str
-    creator_id: int
+    created_by: UUID
     contribution_amount: Decimal
     currency: str
-    frequency: str
+    cycle_frequency: str
+    start_date: date
     total_cycles: int
+    payout_order_method: str
     grace_period_days: int
+    late_penalty_amount: Decimal
+    default_penalty: Optional[str] = None
+    collateral_required: bool
+    contract_url: Optional[str] = None
+    contract_mode: str
     status: str
-    start_date: Optional[datetime] = None
     created_at: datetime
+    updated_at: datetime
     members: List[RoundMemberResponse] = []
-    current_cycle: Optional[CycleResponse] = None
+    cycles: List[RoundCycleResponse] = []
+
+    model_config = {"from_attributes": True}
+
+
+class RoundSummaryResponse(BaseModel):
+    id: UUID
+    name: str
+    created_by: UUID
+    contribution_amount: Decimal
+    currency: str
+    cycle_frequency: str
+    total_cycles: int
+    status: str
+    members_count: int
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class InviteLinkResponse(BaseModel):
+    token: str
+    created_at: datetime
+    expires_at: Optional[datetime] = None
+    uses: int
+    max_uses: Optional[int] = None
+
+
+class PayoutPositionRequest(BaseModel):
+    payout_order: dict[UUID, int]  # user_id -> position mapping
+
+
+class RoundPreviewResponse(BaseModel):
+    id: UUID
+    name: str
+    creator_name: str
+    contribution_amount: Decimal
+    currency: str
+    cycle_frequency: str
+    total_cycles: int
+    status: str
+    members_count: int
+    start_date: date
+    created_at: datetime
 
     model_config = {"from_attributes": True}

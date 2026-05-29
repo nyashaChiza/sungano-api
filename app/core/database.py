@@ -7,13 +7,7 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-    connect_args=(
-        {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
-    ),
-)
+engine = create_async_engine(settings.DATABASE_URL, echo=False)
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
