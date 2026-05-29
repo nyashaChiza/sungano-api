@@ -1,4 +1,5 @@
 from typing import Annotated
+from uuid import UUID
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,14 +24,14 @@ async def get_current_user(
     if not payload:
         raise credentials_exception
 
-    user_id: int = payload.get("sub")
+    user_id: str = payload.get("sub")
     if user_id is None:
         raise credentials_exception
 
     # Import here to avoid circular imports
     from app.models.user import User
 
-    result = await db.execute(select(User).where(User.id == int(user_id)))
+    result = await db.execute(select(User).where(User.id == UUID(user_id)))
     user = result.scalar_one_or_none()
 
     if user is None:

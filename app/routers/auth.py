@@ -1,6 +1,6 @@
 import secrets
 from typing import Annotated
-from datetime import timedelta
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -15,6 +15,7 @@ from app.schemas.auth import (
     UserRegisterRequest, UserLoginRequest, Token, VerifyOTPRequest,
     ForgotPasswordRequest, ResetPasswordRequest, RefreshTokenRequest
 )
+from app.services.email_service import send_otp_email
 
 router = APIRouter()
 
@@ -61,12 +62,11 @@ async def register(
 
     # Generate phone verification OTP
     otp_token = generate_otp()
-    otp_expires_at = timedelta(minutes=10)
     verification_token = VerificationToken(
         user_id=user.id,
         token=otp_token,
         type="phone_verify",
-        expires_at=otp_expires_at
+        expires_at=datetime.utcnow() + timedelta(minutes=10)
     )
     db.add(verification_token)
 
@@ -80,7 +80,7 @@ async def register(
     refresh_token_db = RefreshToken(
         user_id=user.id,
         token_hash=refresh_token_hash,
-        expires_at=timedelta(days=30)
+        expires_at=datetime.utcnow() + timedelta(days=30)
     )
     db.add(refresh_token_db)
     await db.commit()
@@ -116,7 +116,7 @@ async def login(
     refresh_token_db = RefreshToken(
         user_id=user.id,
         token_hash=refresh_token_hash,
-        expires_at=timedelta(days=30)
+        expires_at=datetime.utcnow() + timedelta(days=30)
     )
     db.add(refresh_token_db)
     await db.commit()
@@ -231,12 +231,12 @@ async def forgot_password(
         user_id=user.id,
         token=reset_token[:10],
         type="password_reset",
-        expires_at=timedelta(hours=1)
+        expires_at=datetime.utcnow() + timedelta(hours=1)
     )
     db.add(verification_token)
     await db.commit()
 
-    # TODO: Send email with reset link
+    await send_otp_email(user.email, reset_token[:10], "reset_password", user.full_name)
     return {"status": "success", "message": "If email exists, reset code has been sent"}
 
 
